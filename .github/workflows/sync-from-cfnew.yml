@@ -1,4 +1,4 @@
-name: 从 cfnew 同步 Releases
+name: 从 cfnew 同步 _worker.js
 
 on:
   workflow_dispatch:  # 手动触发
@@ -14,8 +14,17 @@ concurrency:
   group: sync-from-cfnew
   cancel-in-progress: false
 
+env:
+  UPSTREAM_REPO: byJoey/cfnew
+  UPSTREAM_BRANCH: main
+  # 上游把可部署源码放在这个伪装文件名下。它和 Release 里 Pages.zip 解出的
+  # _worker.js 是同一份内容（blob 62abe996272748f5edf63d38ec011f159184d8dd）。
+  # 上游若改名，本工作流会明确报错并提示改这里。
+  UPSTREAM_PATH: 明文源吗
+  TARGET_FILE: _worker.js
+
 jobs:
-  sync-release:
+  sync-worker:
     runs-on: ubuntu-latest
 
     steps:
@@ -24,173 +33,133 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: 获取 cfnew 最新发布
-        id: get_latest
+      - name: 对比上游文件与本地 _worker.js
+        id: cmp
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
 
-          API_URL="https://api.github.com/repos/byJoey/cfnew/releases/latest"
-          BODY="$(mktemp)"
-          CODE="000"
+          # 调用 GitHub API：带 token（5000 次/小时），失败重试 3 次，显式校验状态码
+          gh_api() {
+            local url="$1" out="$2" code="000" attempt
+            for attempt in 1 2 3; do
+              if code="$(curl -sS -o "$out" -w '%{http_code}' \
+                   -H "Authorization: Bearer ${GH_TOKEN}" \
+                   -H "Accept: application/vnd.github+json" \
+                   -H "X-GitHub-Api-Version: 2022-11-28" \
+                   "$url")"; then
+                :
+              else
+                code="000"
+              fi
+              if [ "$code" = "200" ]; then
+                echo "$code"
+                return 0
+              fi
+              echo "请求失败（HTTP ${code}，第 ${attempt}/3 次）: ${url}" >&2
+              sleep 5
+            done
+            echo "$code"
+          }
 
-          # 修复记录：旧版此处使用「未认证 curl + sed 取值」。api.github.com 未认证额度
-          # 仅 60 次/小时且按出口 IP 共享，Runner 的 IP 被大量任务共用，一旦被限流就返回
-          # 403 错误体 -> sed 取不到 assets_url -> curl "" -> 步骤以 exit code 3 直接挂掉。
-          # 现在改为：带 GITHUB_TOKEN 调用（5000 次/小时）+ 3 次重试 + 显式 HTTP 状态码校验。
-          for attempt in 1 2 3; do
-            if CODE="$(curl -sS -o "$BODY" -w '%{http_code}' \
-                 -H "Authorization: Bearer ${GH_TOKEN}" \
-                 -H "Accept: application/vnd.github+json" \
-                 -H "X-GitHub-Api-Version: 2022-11-28" \
-                 "$API_URL")"; then
-              :
-            else
-              CODE="000"
-            fi
+          ENC_PATH="$(jq -rn --arg v "$UPSTREAM_PATH" '$v|@uri')"
+          META="$(mktemp)"
 
-            if [ "$CODE" = "200" ]; then
-              echo "已获取 cfnew 最新发布（第 ${attempt} 次尝试）"
-              break
-            fi
-
-            echo "第 ${attempt} 次请求失败（HTTP ${CODE}），10 秒后重试..."
-            sleep 10
-          done
+          CODE="$(gh_api "https://api.github.com/repos/${UPSTREAM_REPO}/contents/${ENC_PATH}?ref=${UPSTREAM_BRANCH}" "$META")"
 
           if [ "$CODE" != "200" ]; then
-            echo "错误：获取 byJoey/cfnew 最新发布失败（HTTP ${CODE}）"
+            echo "错误：读取上游 ${UPSTREAM_REPO}/${UPSTREAM_PATH} 失败（HTTP ${CODE}）"
             echo "响应内容："
-            head -c 800 "$BODY" || true
+            head -c 800 "$META" || true
             echo
+            echo "若为 404，说明上游改名或调整了目录结构。请到"
+            echo "  https://github.com/${UPSTREAM_REPO}"
+            echo "根目录确认当前可部署源码的文件名，然后修改本工作流顶部的 UPSTREAM_PATH。"
             exit 1
           fi
 
-          # 用 jq 解析（Runner 自带），避免 sed 在异常响应下静默产出空值
-          VERSION="$(jq -r '.tag_name // empty' "$BODY")"
-          DOWNLOAD_URL="$(jq -r '(.assets // []) | map(select((.name // "") | test("pages[._-]?zip$"; "i"))) | first | .browser_download_url // empty' "$BODY")"
-          if [ -z "$DOWNLOAD_URL" ]; then
-            # 兜底：按下载链接匹配
-            DOWNLOAD_URL="$(jq -r '(.assets // []) | map(select((.browser_download_url // "") | test("pages[._-]?zip$"; "i"))) | first | .browser_download_url // empty' "$BODY")"
-          fi
-          FILE_NAME="Pages.zip"
+          UPSTREAM_BLOB="$(jq -r '.sha // empty' "$META")"
+          UPSTREAM_SIZE="$(jq -r '.size // empty' "$META")"
 
-          if [ -z "$VERSION" ]; then
-            echo "错误：未能从响应中解析出版本号（tag_name）"
-            exit 1
+          # 本地内容的 git blob 哈希：与上游 blob 同一套算法，内容相同则哈希相同
+          LOCAL_BLOB=""
+          if [ -f "$TARGET_FILE" ]; then
+            LOCAL_BLOB="$(git hash-object "$TARGET_FILE")"
           fi
 
-          if [ -z "$DOWNLOAD_URL" ]; then
-            echo "错误：最新 release（${VERSION}）中没有 Pages.zip 文件"
-            echo "该 release 实际包含的资产："
-            jq -r '(.assets // []) as $a | if ($a | length) > 0 then ($a[] | .name) else "(无)" end' "$BODY"
-            exit 1
-          fi
+          echo "上游 ${UPSTREAM_PATH} : blob=${UPSTREAM_BLOB} size=${UPSTREAM_SIZE}"
+          echo "本地 ${TARGET_FILE}     : blob=${LOCAL_BLOB:-（文件不存在）}"
 
           {
-            echo "version=${VERSION}"
-            echo "download_url=${DOWNLOAD_URL}"
-            echo "file_name=${FILE_NAME}"
+            echo "upstream_blob=${UPSTREAM_BLOB}"
+            echo "upstream_size=${UPSTREAM_SIZE}"
+            echo "local_blob=${LOCAL_BLOB}"
+            echo "enc_path=${ENC_PATH}"
           } >> "$GITHUB_OUTPUT"
 
-          echo "最新版本: ${VERSION}"
-          echo "下载 URL: ${DOWNLOAD_URL}"
-          echo "文件名: ${FILE_NAME}"
-
-      - name: 检查当前版本
-        id: check_version
-        run: |
-          # 读取当前记录的版本，如果文件不存在则创建空文件
-          if [ ! -f "VERSION.txt" ]; then
-            echo "未找到版本记录文件，创建新文件"
-            touch VERSION.txt
-            CURRENT_VERSION=""
+          if [ -n "$LOCAL_BLOB" ] && [ "$UPSTREAM_BLOB" = "$LOCAL_BLOB" ]; then
+            echo "内容一致（blob 相同），无需更新"
+            echo "need_update=false" >> "$GITHUB_OUTPUT"
           else
-            CURRENT_VERSION=$(cat VERSION.txt | tr -d '\n\r ')
-            if [ -z "$CURRENT_VERSION" ]; then
-              echo "版本记录文件为空，将进行首次更新"
-            else
-              echo "当前记录的版本: $CURRENT_VERSION"
-            fi
+            echo "检测到上游内容变化，需要更新"
+            echo "need_update=true" >> "$GITHUB_OUTPUT"
           fi
 
-          NEW_VERSION="${{ steps.get_latest.outputs.version }}"
-          echo "latest_version=$NEW_VERSION" >> $GITHUB_OUTPUT
-          echo "current_version=$CURRENT_VERSION" >> $GITHUB_OUTPUT
-
-          # 如果版本文件不存在或为空，或者版本不同，则需要更新
-          if [ -z "$CURRENT_VERSION" ] || [ "$CURRENT_VERSION" != "$NEW_VERSION" ]; then
-            if [ -z "$CURRENT_VERSION" ]; then
-              echo "首次运行，将下载文件并创建版本记录"
-            else
-              echo "发现新版本 $CURRENT_VERSION -> $NEW_VERSION，需要更新"
-            fi
-            echo "need_update=true" >> $GITHUB_OUTPUT
-          else
-            echo "版本相同，无需更新"
-            echo "need_update=false" >> $GITHUB_OUTPUT
-          fi
-
-      - name: 下载并更新文件
-        if: steps.check_version.outputs.need_update == 'true'
+      - name: 下载并更新 _worker.js
+        if: steps.cmp.outputs.need_update == 'true'
         env:
-          DOWNLOAD_URL: ${{ steps.get_latest.outputs.download_url }}
-          FILE_NAME: ${{ steps.get_latest.outputs.file_name }}
-          VERSION: ${{ steps.get_latest.outputs.version }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ENC_PATH: ${{ steps.cmp.outputs.enc_path }}
+          EXPECTED_BLOB: ${{ steps.cmp.outputs.upstream_blob }}
         run: |
-          if [ -z "$DOWNLOAD_URL" ] || [ "$DOWNLOAD_URL" = "null" ]; then
-            echo "错误：未找到可下载的文件"
+          set -euo pipefail
+
+          RAW_URL="https://raw.githubusercontent.com/${UPSTREAM_REPO}/${UPSTREAM_BRANCH}/${ENC_PATH}"
+          echo "下载: ${RAW_URL}"
+          curl -sSL --retry 3 --retry-delay 5 -f -o "$TARGET_FILE" "$RAW_URL"
+
+          # 下载后立刻校验：算出来的 blob 必须与上游一致，否则不提交
+          ACTUAL_BLOB="$(git hash-object "$TARGET_FILE")"
+          echo "下载后 blob : ${ACTUAL_BLOB}"
+          echo "上游   blob : ${EXPECTED_BLOB}"
+          if [ "$ACTUAL_BLOB" != "$EXPECTED_BLOB" ]; then
+            echo "错误：下载内容与上游 blob 不一致，已中止（不会提交）"
             exit 1
           fi
+          echo "校验通过：内容与上游完全一致"
 
-          if [ -z "$VERSION" ] || [ "$VERSION" = "null" ]; then
-            echo "错误：未获取到版本号"
-            exit 1
-          fi
+          # 取上游最近一次改动该文件的提交，写进版本记录与提交信息
+          CMT="$(mktemp)"
+          curl -sS -o "$CMT" \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${UPSTREAM_REPO}/commits?path=${ENC_PATH}&per_page=1" || true
 
-          echo "正在下载文件: $FILE_NAME"
-          curl -L --retry 3 --retry-delay 5 -f -o "$FILE_NAME" "$DOWNLOAD_URL"
+          C_SHA="$(jq -r '.[0].sha // empty' "$CMT" 2>/dev/null || true)"
+          C_DATE="$(jq -r '.[0].commit.committer.date // empty' "$CMT" 2>/dev/null || true)"
+          C_SUBJ="$(jq -r '(.[0].commit.message // "") | split("\n")[0]' "$CMT" 2>/dev/null || true)"
+          SHORT="${C_SHA:0:7}"
 
-          if [ ! -f "$FILE_NAME" ]; then
-            echo "错误：下载失败"
-            exit 1
-          fi
+          printf '%s@%s\n' "$UPSTREAM_BRANCH" "${SHORT:-unknown}" > VERSION.txt
+          echo "VERSION.txt -> $(cat VERSION.txt)"
 
-          echo "下载成功: $FILE_NAME"
-
-          # 解压缩 Pages.zip
-          echo "正在解压缩 $FILE_NAME..."
-          if ! unzip -o "$FILE_NAME" -d .; then
-            echo "错误：解压缩失败"
-            exit 1
-          fi
-
-          echo "解压缩成功"
-
-          # 删除 zip 文件（可选，如果不需要保留）
-          rm -f "$FILE_NAME"
-          echo "已删除压缩文件: $FILE_NAME"
-
-          # 确保创建或更新版本记录文件
-          if [ ! -f "VERSION.txt" ]; then
-            echo "创建版本记录文件"
-            touch VERSION.txt
-          fi
-
-          # 写入版本号
-          echo "$VERSION" > VERSION.txt
-          echo "版本记录已创建/更新: $VERSION"
-
-          # 验证文件是否成功写入
-          if [ -f "VERSION.txt" ] && [ -s "VERSION.txt" ]; then
-            echo "✓ 版本记录文件创建成功"
-          else
-            echo "✗ 警告：版本记录文件可能未正确创建"
-          fi
+          # 提交信息写到 RUNNER_TEMP，避免被 git add -A 带进仓库
+          MSGFILE="${RUNNER_TEMP}/commit-msg.txt"
+          {
+            printf '自动同步: 更新 _worker.js 到 %s@%s\n\n' "$UPSTREAM_REPO" "${SHORT:-unknown}"
+            printf '上游文件 : %s\n' "$UPSTREAM_PATH"
+            printf '上游提交 : %s\n' "${C_SHA:-(未取到)}"
+            printf '提交时间 : %s\n' "${C_DATE:-(未取到)}"
+            printf '提交说明 : %s\n' "${C_SUBJ:-(未取到)}"
+            printf 'blob     : %s\n' "$ACTUAL_BLOB"
+          } > "$MSGFILE"
+          echo "提交信息："
+          cat "$MSGFILE"
 
       - name: 提交并推送更改
-        if: steps.check_version.outputs.need_update == 'true'
+        if: steps.cmp.outputs.need_update == 'true'
         run: |
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
@@ -200,22 +169,25 @@ jobs:
           if git diff --staged --quiet; then
             echo "没有变更需要提交"
           else
-            git commit -m "自动同步: 更新到 cfnew ${{ steps.get_latest.outputs.version }}"
+            git commit -F "${RUNNER_TEMP}/commit-msg.txt"
             git push
             echo "已提交并推送更新"
           fi
 
       - name: 输出摘要
+        if: always()
         run: |
           {
-            echo "## 同步结果"
-            echo "- 最新版本: ${{ steps.get_latest.outputs.version }}"
-            echo "- 当前版本: ${{ steps.check_version.outputs.current_version }}"
+            echo "## cfnew 同步结果"
+            echo "- 上游: \`${UPSTREAM_REPO}@${UPSTREAM_BRANCH}/${UPSTREAM_PATH}\`"
+            echo "- 上游 blob: \`${{ steps.cmp.outputs.upstream_blob }}\`"
+            echo "- 本地 blob: \`${{ steps.cmp.outputs.local_blob }}\`"
           } >> $GITHUB_STEP_SUMMARY
 
-          if [ "${{ steps.check_version.outputs.need_update }}" = "true" ]; then
-            echo "- 状态: ✅ 已更新到新版本" >> $GITHUB_STEP_SUMMARY
-            echo "- 下载文件: ${{ steps.get_latest.outputs.file_name }}" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ steps.cmp.outputs.need_update }}" = "true" ]; then
+            echo "- 状态: ✅ 已更新 \`_worker.js\`（跟随上游 commit）" >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ steps.cmp.outputs.need_update }}" = "false" ]; then
+            echo "- 状态: ⏭️ 内容一致，无需更新" >> $GITHUB_STEP_SUMMARY
           else
-            echo "- 状态: ⏭️ 版本相同，无需更新" >> $GITHUB_STEP_SUMMARY
+            echo "- 状态: ❌ 比对未完成，请查看上方日志" >> $GITHUB_STEP_SUMMARY
           fi
